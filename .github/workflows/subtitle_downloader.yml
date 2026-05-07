@@ -31,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT }}
+          
 
       - name: نصب Python 3.9
         uses: actions/setup-python@v5
@@ -70,7 +70,7 @@ jobs:
             git push origin HEAD:main
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: تولید گزارش نهایی
         if: always()
