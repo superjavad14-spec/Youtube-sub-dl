@@ -1,91 +1,211 @@
-name: YouTube Subtitle Downloader & Protector
+#!/usr/bin/env python3
+"""
+YouTube Subtitle Downloader – دانلود، ترجمه و رمزگذاری زیرنویس
+"""
 
-on:
-  workflow_dispatch:
-    inputs:
-      video_url:
-        description: 'آدرس ویدیوی یوتیوب'
-        required: true
-        type: string
-      subtitle_language:
-        description: 'زبان زیرنویس (en یا fa)'
-        required: true
-        type: choice
-        options:
-          - en
-          - fa
-      zip_password:
-        description: 'رمز عبور فایل ZIP (فقط در صورت نیاز)'
-        required: false
-        type: string
-        default: ''
+import argparse
+import json
+import os
+import sys
+from typing import Any, Dict, List, Optional
 
-permissions:
-  contents: write
+# افزودن پوشهٔ scripts به مسیر جستجوی ماژول‌ها
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-jobs:
-  download-and-protect:
-    runs-on: ubuntu-latest
-    steps:
-      - name: دریافت کد مخزن
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+import yt_dlp
+from translator import translate_srt
+from zip_protector import create_encrypted_zip
 
-      - name: نصب Python 3.9
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
 
-      - name: نصب پیش‌نیازهای سیستمی
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg zip
+def get_video_info(video_url: str) -> Dict[str, Any]:
+    """دریافت اطلاعات ویدیو و زیرنویس‌های موجود"""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(video_url, download=False)
 
-      - name: نصب کتابخانه‌های پایتون
-        run: |
-          pip install -r requirements.txt
 
-      - name: اجرای دانلود و پردازش زیرنویس
-        id: download
-        run: |
-          python scripts/subtitle_downloader.py \
-            --video-url "${{ inputs.video_url }}" \
-            --lang "${{ inputs.subtitle_language }}" \
-            --zip-password "${{ inputs.zip_password }}" \
-            --output-dir subtitles
+def list_all_subs(info: dict) -> List[str]:
+    """بازگرداندن فهرست تمام زبان‌های زیرنویس (دستی و خودکار)"""
+    subs = set()
+    for key in ('subtitles', 'automatic_captions'):
+        if key in info and info[key]:
+            subs.update(info[key].keys())
+    return list(subs)
 
-      - name: ثبت و ارسال فایل‌ها به مخزن
-        if: success()
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "GitHub Actions Bot"
-          git add subtitles/ video_info.json final_output_info.json
-          if git diff --staged --quiet; then
-            echo "بدون تغییر برای commit"
-          else
-            VID_TITLE=$(python -c "import json; print(json.load(open('video_info.json'))['title'])" 2>/dev/null || echo "video")
-            git commit -m "Add subtitle for ${VID_TITLE}"
-            git push origin HEAD:main
-          fi
 
-      - name: تولید گزارش نهایی
-        if: always()
-        run: |
-          echo "### 🎬 نتیجه دانلود زیرنویس یوتیوب" >> $GITHUB_STEP_SUMMARY
-          if [ -f video_info.json ]; then
-            TITLE=$(python -c "import json; print(json.load(open('video_info.json'))['title'])")
-            echo "- **عنوان ویدیو:** $TITLE" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "- **زبان انتخاب‌شده:** ${{ inputs.subtitle_language }}" >> $GITHUB_STEP_SUMMARY
-          if [ -f final_output_info.json ]; then
-            OUTPUT_FILE=$(python -c "import json; print(json.load(open('final_output_info.json'))['output_file'])")
-            IS_ZIP=$(python -c "import json; print(json.load(open('final_output_info.json'))['is_zip'])")
-            echo "- **فایل خروجی:** [${OUTPUT_FILE}](https://github.com/${{ github.repository }}/blob/main/${OUTPUT_FILE})" >> $GITHUB_STEP_SUMMARY
-            if [ "$IS_ZIP" = "true" ]; then
-              PASSWORD=$(python -c "import json; print(json.load(open('final_output_info.json'))['password'])")
-              echo "- **رمز عبور ZIP:** \`$PASSWORD\`" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "⚠️ خطا: فایل خروجی تولید نشد." >> $GITHUB_STEP_SUMMARY
-          fi
+def download_subtitle(
+    video_url: str,
+    lang: str,
+    output_dir: str,
+    video_title: str
+) -> str:
+    """دانلود زیرنویس به فرمت SRT و بازگرداندن مسیر فایل"""
+    outtmpl = os.path.join(output_dir, f'{video_title}.%(ext)s')
+    ydl_opts = {
+        'quiet': False,  # موقتاً خاموش تا خروجی yt-dlp دیده شود
+        'no_warnings': False,
+        'skip_download': True,
+        'writeautomaticsub': True,
+        'writesubtitles': True,
+        'subtitleslangs': [lang],
+        'convertsubs': 'srt',
+        'outtmpl': outtmpl,
+    }
+    print(f"🔍 در حال دانلود زیرنویس {lang} با الگوی خروجی: {outtmpl}")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([video_url])
+
+    # لیست تمام فایل‌های SRT موجود در پوشه خروجی
+    srt_files = [f for f in os.listdir(output_dir) if f.endswith('.srt')]
+    print(f"📁 فایل‌های SRT موجود در {output_dir}: {srt_files}")
+
+    # اولویت: فایلی که شامل کد زبان باشد (مثلاً .en.srt)
+    for fname in srt_files:
+        if f'.{lang}.' in fname or fname.endswith(f'.{lang}.srt'):
+            return os.path.join(output_dir, fname)
+
+    # اگر پیدا نشد، اولین فایل SRT را برگردان (احتمالاً نام دیگری دارد)
+    if srt_files:
+        print("⚠️ فایل با پسوند زبان یافت نشد، اولین فایل SRT بازگردانده می‌شود.")
+        return os.path.join(output_dir, srt_files[0])
+
+    raise FileNotFoundError(
+        f"فایل زیرنویس برای زبان '{lang}' پس از دانلود یافت نشد."
+    )
+
+
+def sanitize_filename(name: str) -> str:
+    """حذف کاراکترهای غیرمجاز از نام فایل"""
+    return "".join(c for c in name if c.isalnum() or c in ' _-').strip()
+
+
+def process_subtitle(
+    video_url: str,
+    lang: str,
+    zip_password: str,
+    output_dir: str
+) -> None:
+    """کل فرایند را اجرا می‌کند (قابل تست مجزا)"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("📡 دریافت اطلاعات ویدیو...")
+    try:
+        info = get_video_info(video_url)
+    except Exception as e:
+        print(f"❌ خطا در دریافت اطلاعات ویدیو: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    title_raw = info.get('title', 'unknown_video')
+    safe_title = sanitize_filename(title_raw)
+    available_subs = list_all_subs(info)
+
+    print(f"🎬 عنوان ویدیو: {safe_title}")
+    print(f"🌐 زبان‌های زیرنویس موجود: {available_subs}")
+
+    with open('video_info.json', 'w', encoding='utf-8') as f:
+        json.dump({
+            'title': safe_title,
+            'available_subs': available_subs
+        }, f)
+
+    srt_file: str
+
+    if lang in available_subs:
+        print(f"⬇️ دانلود مستقیم زیرنویس {lang}...")
+        try:
+            srt_file = download_subtitle(video_url, lang, output_dir, safe_title)
+        except Exception as e:
+            print(f"❌ خطا در دانلود زیرنویس {lang}: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif lang == 'fa':
+        if 'en' not in available_subs:
+            print(
+                "❌ خطا: زیرنویس انگلیسی برای ترجمه به فارسی موجود نیست. "
+                "لطفاً ویدیویی انتخاب کنید که زیرنویس انگلیسی داشته باشد.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        print("🔄 فارسی موجود نیست – دانلود انگلیسی و ترجمه...")
+        try:
+            eng_srt = download_subtitle(video_url, 'en', output_dir, safe_title)
+        except Exception as e:
+            print(f"❌ خطا در دانلود زیرنویس انگلیسی: {e}", file=sys.stderr)
+            sys.exit(1)
+        fa_srt = os.path.join(output_dir, f'{safe_title}.fa.srt')
+        print("🔄 در حال ترجمه...")
+        translate_srt(eng_srt, fa_srt)
+        os.remove(eng_srt)
+        srt_file = fa_srt
+    else:
+        print(
+            f"❌ زبان '{lang}' در زیرنویس‌های ویدیو پیدا نشد.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    file_size = os.path.getsize(srt_file)
+    print(f"📏 حجم فایل: {file_size} بایت")
+
+    output_file = srt_file
+    is_zip = False
+    password_used: Optional[str] = None
+
+    THRESHOLD = 100 * 1024 * 1024  # 100 MB
+
+    if file_size > THRESHOLD:
+        if not zip_password:
+            print(
+                "❌ حجم فایل بیش از ۱۰۰ مگابایت است و رمز عبور ZIP ارائه نشده.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        zip_path = os.path.join(
+            output_dir,
+            f'{safe_title}.{lang}.zip'
+        )
+        print(f"🔐 ساخت ZIP رمزگذاری‌شده: {zip_path}")
+        create_encrypted_zip(srt_file, zip_path, zip_password)
+        os.remove(srt_file)
+        output_file = zip_path
+        is_zip = True
+        password_used = zip_password
+    else:
+        if not srt_file.startswith(output_dir):
+            dest = os.path.join(output_dir, os.path.basename(srt_file))
+            os.rename(srt_file, dest)
+            output_file = dest
+
+    with open('final_output_info.json', 'w', encoding='utf-8') as f:
+        json.dump({
+            'output_file': output_file,
+            'is_zip': is_zip,
+            'password': password_used or ''
+        }, f)
+
+    print(f"✅ فایل نهایی: {output_file}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="دانلود و محافظت از زیرنویس یوتیوب"
+    )
+    parser.add_argument('--video-url', required=True)
+    parser.add_argument('--lang', required=True, choices=['en', 'fa'])
+    parser.add_argument('--zip-password', default='')
+    parser.add_argument('--output-dir', default='subtitles')
+    args = parser.parse_args()
+
+    process_subtitle(
+        video_url=args.video_url,
+        lang=args.lang,
+        zip_password=args.zip_password,
+        output_dir=args.output_dir
+    )
+
+
+if __name__ == '__main__':
+    main()
