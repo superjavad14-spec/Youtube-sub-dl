@@ -1,0 +1,94 @@
+name: YouTube Subtitle Downloader & Protector
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'آدرس ویدیوی یوتیوب'
+        required: true
+        type: string
+      subtitle_language:
+        description: 'زبان زیرنویس (en یا fa)'
+        required: true
+        type: choice
+        options:
+          - en
+          - fa
+      zip_password:
+        description: 'رمز عبور فایل ZIP (فقط در صورت نیاز)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-protect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: دریافت کد مخزن
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: نصب Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: نصب پیش‌نیازهای سیستمی
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip
+
+      - name: نصب کتابخانه‌های پایتون
+        run: |
+          pip install -r requirements.txt
+
+      - name: اجرای دانلود و پردازش زیرنویس
+        id: download
+        run: |
+          python scripts/subtitle_downloader.py \
+            --video-url "${{ inputs.video_url }}" \
+            --lang "${{ inputs.subtitle_language }}" \
+            --zip-password "${{ inputs.zip_password }}" \
+            --output-dir subtitles
+
+      - name: ثبت و ارسال فایل‌ها به مخزن
+        if: success()
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+          git add subtitles/ video_info.json final_output_info.json
+          if git diff --staged --quiet; then
+            echo "بدون تغییر برای commit"
+          else
+            VID_TITLE=$(python -c "import json; print(json.load(open('video_info.json'))['title'])" 2>/dev/null || echo "video")
+            git commit -m "Add subtitle for ${VID_TITLE}"
+            git push origin HEAD:main
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: تولید گزارش نهایی
+        if: always()
+        run: |
+          echo "### 🎬 نتیجه دانلود زیرنویس یوتیوب" >> $GITHUB_STEP_SUMMARY
+          if [ -f video_info.json ]; then
+            TITLE=$(python -c "import json; print(json.load(open('video_info.json'))['title'])")
+            echo "- **عنوان ویدیو:** $TITLE" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **زبان انتخاب‌شده:** ${{ inputs.subtitle_language }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f final_output_info.json ]; then
+            OUTPUT_FILE=$(python -c "import json; print(json.load(open('final_output_info.json'))['output_file'])")
+            IS_ZIP=$(python -c "import json; print(json.load(open('final_output_info.json'))['is_zip'])")
+            echo "- **فایل خروجی:** [${OUTPUT_FILE}](https://github.com/${{ github.repository }}/blob/main/${OUTPUT_FILE})" >> $GITHUB_STEP_SUMMARY
+            if [ "$IS_ZIP" = "true" ]; then
+              PASSWORD=$(python -c "import json; print(json.load(open('final_output_info.json'))['password'])")
+              echo "- **رمز عبور ZIP:** \`$PASSWORD\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ خطا: فایل خروجی تولید نشد." >> $GITHUB_STEP_SUMMARY
+          fi
