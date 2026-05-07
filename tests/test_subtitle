@@ -1,0 +1,91 @@
+import os
+import tempfile
+
+import pyzipper
+import pytest
+from unittest.mock import patch, MagicMock
+
+from scripts.zip_protector import create_encrypted_zip
+from scripts.translator import translate_srt
+
+
+def test_encrypted_zip_creation_and_access():
+    """تست ساخت ZIP رمزگذاری شده و عدم دسترسی بدون رمز"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path = os.path.join(tmpdir, 'test.srt')
+        with open(file_path, 'w') as f:
+            f.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n\n")
+
+        zip_path = os.path.join(tmpdir, 'test.zip')
+        password = "p@ssw0rd!"
+        create_encrypted_zip(file_path, zip_path, password)
+
+        assert os.path.exists(zip_path)
+
+        # تلاش برای خواندن بدون رمز باید خطا دهد
+        with pytest.raises(RuntimeError):
+            with pyzipper.AESZipFile(zip_path, 'r') as zf:
+                zf.read('test.srt')
+
+        # با رمز صحیح باید خوانده شود
+        with pyzipper.AESZipFile(zip_path, 'r') as zf:
+            zf.setpassword(password.encode())
+            content = zf.read('test.srt').decode('utf-8')
+        assert "Hello" in content
+
+
+@patch('scripts.translator.GoogleTranslator')
+def test_translate_srt_mock(mock_translator):
+    """تست ترجمه با ماکت GoogleTranslator"""
+    instance = MagicMock()
+    instance.translate = MagicMock(
+        side_effect=lambda text: "سلام" if text.strip() else text
+    )
+    mock_translator.return_value = instance
+
+    input_content = "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, 'input.srt')
+        output_path = os.path.join(tmpdir, 'output.srt')
+        with open(input_path, 'w', encoding='utf-8') as f:
+            f.write(input_content)
+
+        translate_srt(input_path, output_path)
+
+        with open(output_path, 'r', encoding='utf-8') as f:
+            result = f.read()
+
+        assert "سلام" in result
+        assert "00:00:01,000 --> 00:00:02,000" in result
+
+
+@patch('scripts.subtitle_downloader.download_subtitle')
+@patch('scripts.subtitle_downloader.get_video_info')
+@patch('scripts.subtitle_downloader.translate_srt')
+@patch('os.path.getsize', return_value=100)  # حجم کمتر از ۱۰۰ مگابایت
+def test_fa_fallback_to_en_translation(
+    mock_getsize, mock_translate, mock_get_info, mock_download, tmp_path
+):
+    """شبیه‌سازی انتخاب فارسی بدون موجودیت و ترجمه از انگلیسی"""
+    mock_get_info.return_value = {
+        'title': 'Test Video',
+        'subtitles': {'en': [{'ext': 'vtt'}]},
+        'automatic_captions': {}
+    }
+
+    fake_en_srt = tmp_path / "subs" / "Test Video.en.srt"
+    os.makedirs(fake_en_srt.parent, exist_ok=True)
+    fake_en_srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n\n")
+    mock_download.return_value = str(fake_en_srt)
+
+    from scripts.subtitle_downloader import process_subtitle
+
+    process_subtitle(
+        video_url='https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        lang='fa',
+        zip_password='',
+        output_dir=str(tmp_path / "subtitles")
+    )
+
+    # باید تابع ترجمه فراخوانی شده باشد
+    mock_translate.assert_called_once()
